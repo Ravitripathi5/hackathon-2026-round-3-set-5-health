@@ -18,6 +18,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 REGION = "ap-south-1"
 SETS = {1: "upload", 2: "payments", 3: "fanout", 4: "archive", 5: "health"}
@@ -81,6 +82,20 @@ def invoke(function, payload, qualifier=None):
         return json.loads(body), ""
     except json.JSONDecodeError:
         return None, body
+
+
+def unwrap_proxy_response(value):
+    """Return the JSON body from an API Gateway/Lambda URL response envelope."""
+    if not isinstance(value, dict) or "body" not in value:
+        return value
+    body = value.get("body")
+    if not isinstance(body, str):
+        return value
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return value
+    return parsed if isinstance(parsed, dict) else value
 
 
 def read(path):
@@ -171,9 +186,17 @@ def check_boundary(rep, prefix, app, pid):
 def check_function(rep, fn):
     ok, data, err = aws("lambda", "get-function", "--function-name", fn)
     cfg = (data or {}).get("Configuration", {}) if ok else {}
-    good = cfg.get("PackageType") == "Image" and cfg.get("State") == "Active" and cfg.get("LastUpdateStatus") == "Successful"
-    rep.add("A", "A4.function", f"Lambda {fn} is an Image function and Active", 3, good,
-            err or f"package={cfg.get('PackageType')} state={cfg.get('State')}")
+    image_uri = ((data or {}).get("Code") or {}).get("ImageUri", "") if ok else ""
+    good = (
+        cfg.get("PackageType") == "Image"
+        and cfg.get("State") == "Active"
+        and cfg.get("LastUpdateStatus") == "Successful"
+        and cfg.get("Architectures") == ["arm64"]
+        and image_uri.endswith(":v1")
+    )
+    rep.add("A", "A4.function", f"Lambda {fn} is Active on arm64 and uses image :v1", 3, good,
+            err or f"package={cfg.get('PackageType')} state={cfg.get('State')} "
+                   f"architectures={cfg.get('Architectures')} image={image_uri}")
     return cfg
 
 
@@ -199,15 +222,19 @@ def check_tags(rep, pid, fn, repo):
     rep.add("C", "C.tags", "Resources carry Hackathon/Participant tags", 2, good, err or f"{len(arns)} tagged resources")
 
 
-def live_set1(rep, prefix, stamp):
-    fn, bucket = f"{prefix}-upload", f"{prefix}-uploads"
+def live_set1(rep, prefix, stamp, account_id):
+    fn, bucket = f"{prefix}-upload", f"{prefix}-uploads-{account_id}"
     check_function(rep, fn)
     key = f"verify/{stamp}.txt"
     res, err = invoke(fn, {"key": key, "content_type": "text/plain"})
+    res = unwrap_proxy_response(res)
     url = (res or {}).get("upload_url") if isinstance(res, dict) else None
     expires = (res or {}).get("expires_in") if isinstance(res, dict) else None
-    rep.add("A", "A4.presign", "Invoke returns a presigned PUT URL (expires_in <= 300)", 5,
-            bool(url) and isinstance(expires, int) and 0 < expires <= 300, err or res)
+    url_ok, url_data, url_err = aws("lambda", "get-function-url-config", "--function-name", fn)
+    auth = (url_data or {}).get("AuthType") if url_ok else None
+    rep.add("A", "A4.presign", "Invoke returns a short-lived PUT URL and Function URL uses AWS_IAM", 5,
+            bool(url) and isinstance(expires, int) and 0 < expires <= 300 and auth == "AWS_IAM",
+            err or url_err or {"response": res, "function_url_auth": auth})
 
     put_ok = False
     if url:
@@ -232,11 +259,6 @@ def live_set1(rep, prefix, stamp):
     rep.add("A", "A5.encryption", "Default bucket encryption configured", 2, ok, err or "ok")
     check_public_block(rep, bucket, 2)
     check_retention(rep, fn, pts=1)
-
-    ok, data, err = aws("lambda", "get-function-url-config", "--function-name", fn)
-    auth = (data or {}).get("AuthType")
-    # scored via function existence path; IAM URL is required by brief (folded into A4.presign path)
-    _ = auth
     return fn
 
 
@@ -251,29 +273,41 @@ def live_set2(rep, prefix, stamp):
     ok, data, err = aws("sqs", "get-queue-url", "--queue-name", qname)
     qurl = (data or {}).get("QueueUrl")
     payment_id = f"pay-{stamp}"
-    count = None
+    item = None
     if qurl:
-        body = json.dumps({"payment_id": payment_id, "amount": 10.0})
-        for i, dedup in enumerate((f"d1-{stamp}", f"d2-{stamp}")):
+        for amount, dedup in ((10.0, f"d1-{stamp}"), (99.0, f"d2-{stamp}")):
+            body = json.dumps({"payment_id": payment_id, "amount": amount})
             aws("sqs", "send-message", "--queue-url", qurl, "--message-body", body,
                 "--message-group-id", "verify", "--message-deduplication-id", dedup)
         deadline = time.time() + POLL_SECONDS
         while time.time() < deadline:
             time.sleep(5)
-            _, scan, _ = aws("dynamodb", "scan", "--table-name", table,
-                             "--filter-expression", "payment_id = :p",
-                             "--expression-attribute-values", json.dumps({":p": {"S": payment_id}}))
-            count = (scan or {}).get("Count")
-            if count is not None and count >= 1:
-                # wait a bit more for duplicate to land, then break
-                time.sleep(8)
-                _, scan, _ = aws("dynamodb", "scan", "--table-name", table,
-                                 "--filter-expression", "payment_id = :p",
-                                 "--expression-attribute-values", json.dumps({":p": {"S": payment_id}}))
-                count = (scan or {}).get("Count")
+            _, got, _ = aws(
+                "dynamodb", "get-item", "--table-name", table,
+                "--key", json.dumps({"payment_id": {"S": payment_id}}), "--consistent-read",
+            )
+            item = (got or {}).get("Item")
+            _, qdata, _ = aws(
+                "sqs", "get-queue-attributes", "--queue-url", qurl,
+                "--attribute-names", "ApproximateNumberOfMessages",
+                "ApproximateNumberOfMessagesNotVisible", "ApproximateNumberOfMessagesDelayed",
+            )
+            qa = (qdata or {}).get("Attributes", {})
+            pending = sum(int(qa.get(k, "0")) for k in (
+                "ApproximateNumberOfMessages",
+                "ApproximateNumberOfMessagesNotVisible",
+                "ApproximateNumberOfMessagesDelayed",
+            ))
+            if item is not None and pending == 0:
                 break
-    rep.add("A", "A4.idempotent", "Same payment_id twice -> exactly one DynamoDB item", 8,
-            count == 1, err or f"count={count}")
+    amount_attr = (item or {}).get("amount", {})
+    stored_amount = amount_attr.get("S", amount_attr.get("N"))
+    try:
+        first_write_preserved = float(stored_amount) == 10.0
+    except (TypeError, ValueError):
+        first_write_preserved = False
+    rep.add("A", "A4.idempotent", "Duplicate payment_id preserves the first DynamoDB write", 8,
+            first_write_preserved, err or f"stored amount={stored_amount}")
 
     attrs = {}
     if qurl:
@@ -341,47 +375,66 @@ def live_set3(rep, prefix, stamp):
     rep.add("A", "A4.email", "Publish channel=email creates a DynamoDB item", 6, email_item is not None, err or email_item)
     rep.add("A", "A4.sms", "Publish channel=sms does not create a table item", 5, email_item is not None and sms_item is None, sms_item)
 
-    # Filter policies on subscriptions
-    filter_ok = False
-    raw_ok = False
+    # Both subscriptions must have the exact channel filter and raw delivery.
+    filter_state = {"email": False, "sms": False}
+    raw_state = {"email": False, "sms": False}
     if topic_arn:
         _, subs, _ = aws("sns", "list-subscriptions-by-topic", "--topic-arn", topic_arn)
         for sub in (subs or {}).get("Subscriptions", []):
+            endpoint = sub.get("Endpoint", "")
+            channel = next((c for c in filter_state if endpoint.endswith(f":{prefix}-notify-{c}")), None)
+            if not channel:
+                continue
             _, attrs, _ = aws("sns", "get-subscription-attributes", "--subscription-arn", sub["SubscriptionArn"])
             a = (attrs or {}).get("Attributes", {})
-            fp = a.get("FilterPolicy") or ""
-            if "email" in fp or "sms" in fp:
-                filter_ok = True
-            if a.get("RawMessageDelivery") == "true":
-                raw_ok = True
+            try:
+                fp = json.loads(a.get("FilterPolicy") or "{}")
+            except json.JSONDecodeError:
+                fp = {}
+            filter_state[channel] = fp.get("channel") == [channel]
+            raw_state[channel] = a.get("RawMessageDelivery") == "true"
+    filter_ok = all(filter_state.values())
+    raw_ok = all(raw_state.values())
     rep.add("A", "A4.filters", "SNS subscriptions use channel filter policies", 3, filter_ok)
-    rep.add("A", "A5.raw", "Raw message delivery enabled on subscriptions", 2, raw_ok)
+    rep.add("A", "A5.raw", "Raw message delivery enabled on both subscriptions", 2, raw_ok)
 
-    # Queue policy scoped to topic
-    q_ok = False
+    # Both queue policies must be scoped to the topic.
+    queue_policy_state = []
     for qn in (f"{prefix}-notify-email", f"{prefix}-notify-sms"):
         _, data, _ = aws("sqs", "get-queue-url", "--queue-name", qn)
         if not data:
+            queue_policy_state.append(False)
             continue
         _, attrs, _ = aws("sqs", "get-queue-attributes", "--queue-url", data["QueueUrl"], "--attribute-names", "Policy")
         pol = (attrs or {}).get("Attributes", {}).get("Policy", "")
-        if topic_arn and topic_arn in pol and "sns.amazonaws.com" in pol:
-            q_ok = True
+        source_account = topic_arn.split(":")[4] if topic_arn else ""
+        queue_policy_state.append(bool(
+            topic_arn
+            and topic_arn in pol
+            and "sns.amazonaws.com" in pol
+            and "aws:SourceAccount" in pol
+            and source_account in pol
+        ))
+    q_ok = len(queue_policy_state) == 2 and all(queue_policy_state)
     rep.add("A", "A5.queue_policy", "Queue policies scoped to the SNS topic", 2, q_ok)
     check_retention(rep, fn, pts=2)
     return fn
 
 
-def live_set4(rep, prefix, stamp):
-    fn, bucket = f"{prefix}-archive", f"{prefix}-archive"
+def live_set4(rep, prefix, stamp, account_id):
+    fn, bucket = f"{prefix}-archive", f"{prefix}-archive-{account_id}"
     app_lg = f"/{prefix}/app"
     check_function(rep, fn)
 
     # Put a log event into the app log group
     stream = f"verify-{stamp}"
-    aws("logs", "create-log-stream", "--log-group-name", app_lg, "--log-stream-name", stream)
-    aws("logs", "put-log-events", "--log-group-name", app_lg, "--log-stream-name", stream,
-        "--log-events", json.dumps([{"timestamp": int(time.time() * 1000), "message": f"archive-verify-{stamp}"}]))
+    created, _, create_err = aws(
+        "logs", "create-log-stream", "--log-group-name", app_lg, "--log-stream-name", stream
+    )
+    sent, _, send_err = aws(
+        "logs", "put-log-events", "--log-group-name", app_lg, "--log-stream-name", stream,
+        "--log-events", json.dumps([{"timestamp": int(time.time() * 1000), "message": f"archive-verify-{stamp}"}])
+    ) if created else (False, None, create_err)
 
     found = None
     deadline = time.time() + POLL_SECONDS
@@ -403,11 +456,16 @@ def live_set4(rep, prefix, stamp):
         if found:
             break
     rep.add("A", "A4.archive", "Log event appears as NDJSON under s3 archive/ within ~2 minutes", 8,
-            found is not None, found or "no object")
+            sent and found is not None, found or send_err or create_err or "no object")
 
     _, pol, _ = aws("lambda", "get-policy", "--function-name", fn)
-    allowed = "logs.amazonaws.com" in json.dumps(pol or {})
-    rep.add("A", "A4.permission", "Lambda permission allows logs.amazonaws.com", 3, allowed)
+    policy_text = json.dumps(pol or {})
+    allowed = (
+        "logs.amazonaws.com" in policy_text
+        and app_lg in policy_text
+        and account_id in policy_text
+    )
+    rep.add("A", "A4.permission", "Logs permission is scoped by source ARN and account", 3, allowed)
 
     ok, data, err = aws("s3api", "get-bucket-lifecycle-configuration", "--bucket", bucket)
     life_ok = False
@@ -416,7 +474,7 @@ def live_set4(rep, prefix, stamp):
         prefix_f = filt.get("Prefix") or (filt.get("And") or {}).get("Prefix") or rule.get("Prefix") or ""
         exp = rule.get("Expiration") or {}
         days = exp.get("Days")
-        if str(prefix_f).startswith("archive") and days == 30:
+        if rule.get("Status") == "Enabled" and prefix_f == "archive/" and days == 30:
             life_ok = True
     rep.add("A", "A4.lifecycle", "Lifecycle expires archive/ objects after 30 days", 4, life_ok, err or data)
 
@@ -428,24 +486,29 @@ def live_set4(rep, prefix, stamp):
 def live_set5(rep, prefix, stamp, pid):
     fn = f"{prefix}-health"
     check_function(rep, fn)
+    probe_started = time.time() - 5
     res, err = invoke(fn, {"probe": True})
     rep.add("A", "A4.invoke", "Health probe invoke succeeds", 0, res is not None, err or res)  # 0 pts helper
 
     ns = f"H3/{pid}"
-    ok, data, err = aws("cloudwatch", "list-metrics", "--namespace", ns, "--metric-name", "HealthCheckFailed")
-    metrics = (data or {}).get("Metrics", []) if ok else []
-    # Also try get-metric-statistics for last 15 minutes
-    end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 900))
-    ok2, data2, err2 = aws(
-        "cloudwatch", "get-metric-statistics",
-        "--namespace", ns, "--metric-name", "HealthCheckFailed",
-        "--start-time", start, "--end-time", end,
-        "--period", "60", "--statistics", "Sum",
-    )
-    dps = (data2 or {}).get("Datapoints", []) if ok2 else []
+    dps = []
+    metric_err = ""
+    deadline = time.time() + POLL_SECONDS
+    while res is not None and time.time() < deadline:
+        end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(probe_started))
+        ok, data, metric_err = aws(
+            "cloudwatch", "get-metric-statistics",
+            "--namespace", ns, "--metric-name", "HealthCheckFailed",
+            "--start-time", start, "--end-time", end,
+            "--period", "60", "--statistics", "Sum",
+        )
+        dps = (data or {}).get("Datapoints", []) if ok else []
+        if dps:
+            break
+        time.sleep(5)
     rep.add("A", "A4.metric", f"Custom metric {ns}/HealthCheckFailed has a datapoint", 5,
-            bool(metrics) or bool(dps), err or err2 or f"metrics={len(metrics)} dps={len(dps)}")
+            res is not None and bool(dps), err or metric_err or f"datapoints={len(dps)}")
 
     ok, data, err = aws("cloudwatch", "describe-alarms", "--alarm-names", f"{prefix}-health-failed")
     alarms = (data or {}).get("MetricAlarms", []) if ok else []
@@ -467,11 +530,13 @@ def live_set5(rep, prefix, stamp, pid):
     rep.add("A", "A4.rule", "EventBridge rate(5 minutes) targets the function", 4,
             enabled and targeted, err or f"enabled={enabled} target={targeted}")
 
-    # Allow-list: unit-tested in app; live check that env TARGET_URL is https
+    # Allow-list: verify the configured target is an exact member.
     ok, data, err = aws("lambda", "get-function-configuration", "--function-name", fn)
     env = (data or {}).get("Environment", {}).get("Variables", {}) if ok else {}
     target = env.get("TARGET_URL", "")
-    allow_ok = target.startswith("https://") and "example.com" in target
+    allowed_hosts = {h.strip().lower() for h in env.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
+    parsed = urlparse(target)
+    allow_ok = parsed.scheme == "https" and bool(parsed.hostname) and parsed.hostname.lower() in allowed_hosts
     rep.add("A", "A4.allowlist", "TARGET_URL is https and allow-listed host", 3, allow_ok, target or err)
 
     ok, data, err = aws("sns", "list-topics")
@@ -495,16 +560,17 @@ def verify(set_no, pid, work, live=True):
         rep.add("A", "A0.aws", "AWS credentials work", 0, False, err)
         return rep
     stamp = time.strftime("%Y%m%d%H%M%S")
+    account_id = str((ident or {}).get("Account", ""))
     check_registry(rep, prefix, app)
     check_boundary(rep, prefix, app, pid)
     if set_no == 1:
-        fn = live_set1(rep, prefix, stamp)
+        fn = live_set1(rep, prefix, stamp, account_id)
     elif set_no == 2:
         fn = live_set2(rep, prefix, stamp)
     elif set_no == 3:
         fn = live_set3(rep, prefix, stamp)
     elif set_no == 4:
-        fn = live_set4(rep, prefix, stamp)
+        fn = live_set4(rep, prefix, stamp, account_id)
     else:
         fn = live_set5(rep, prefix, stamp, pid)
     check_tags(rep, pid, fn, f"{prefix}-{app}")

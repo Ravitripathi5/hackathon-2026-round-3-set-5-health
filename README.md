@@ -1,13 +1,12 @@
 # Secure Event Delivery — Set 5: Service Health Monitor
 
-## Begin here
+This is the participant repository for one 90-minute DevOps and DevSecOps challenge.
 
-Open **[START-HERE.md](START-HERE.md)** and follow it from top to bottom. Do not begin until the organizer starts the clock.
+## Start
 
-Then use:
+1. Clone this repository.
+2. Open **[`START-HERE.md`](START-HERE.md)** and follow it in order.
 
-- [RULES.md](RULES.md) for event rules
-- [BRIEF.md](BRIEF.md) for the exact challenge and resource names
-- [FINDINGS.md](FINDINGS.md) for the six security findings and operations answers
+The repository intentionally contains insecure **fake** examples under `crack-files/`. Do not deploy those files.
 
-This is one public participant set. Work locally and do not push credentials, Terraform state, or your completed solution. Do not run `terraform destroy`; the organizer grades live resources before cleanup.
+Do not commit AWS credentials, Terraform state, or your completed solution. Do not run `terraform destroy`; the organizer grades the live resources and performs cleanup.

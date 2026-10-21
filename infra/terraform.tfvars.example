@@ -1,4 +1,5 @@
 participant_id           = "pXX"
 set_name                 = "health"
 permissions_boundary_arn = "arn:aws:iam::ACCOUNT:policy/h3-pXX-boundary"
-# Replace pXX and ACCOUNT with PARTICIPANT_ID and the boundary ARN from your env file.
+# Set participant_id from PARTICIPANT_ID. Paste the complete
+# PERMISSIONS_BOUNDARY_ARN value into permissions_boundary_arn.

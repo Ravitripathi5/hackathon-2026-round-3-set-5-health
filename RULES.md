@@ -36,7 +36,7 @@ Breaking a rule scores 0 for the set.
 
 ## Setup (organizer gives you `h3-<id>.env`)
 ```bash
-set -a; source ~/Downloads/h3-p07.env; set +a    # replace with your file
+source /path/to/h3-p07.env                       # replace with your actual file
 aws sts get-caller-identity                      # must show user h3-p07
 cp infra/terraform.tfvars.example infra/terraform.tfvars   # then fill in participant_id and boundary ARN
 ```
