@@ -1,4 +1,4 @@
-# Secure Event Delivery — Set 5-health: Health
+# Secure Event Delivery — Set 5: Service Health Monitor
 
 ## Begin here
 
