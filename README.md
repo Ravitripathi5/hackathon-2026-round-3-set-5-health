@@ -1,16 +1,13 @@
-# Secure Event Delivery — Set 5: Health
+# Secure Event Delivery — Set 5-health: Health
 
-This is the participant repository for one 90-minute DevOps and DevSecOps challenge.
+## Begin here
 
-## Start
+Open **[START-HERE.md](START-HERE.md)** and follow it from top to bottom. Do not begin until the organizer starts the clock.
 
-1. Clone this repository.
-2. Read `RULES.md`.
-3. Read `BRIEF.md`.
-4. Load the private `h3-pXX.env` credential file supplied separately by the organizer.
-5. Copy `infra/terraform.tfvars.example` to `infra/terraform.tfvars` and replace its placeholders.
-6. Run the supplied unit tests, build/deploy the service, review `crack-files/`, and submit with `tools/submit.py`.
+Then use:
 
-The repository intentionally contains insecure **fake** examples under `crack-files/`. Do not deploy those files.
+- [RULES.md](RULES.md) for event rules
+- [BRIEF.md](BRIEF.md) for the exact challenge and resource names
+- [FINDINGS.md](FINDINGS.md) for the six security findings and operations answers
 
-Do not commit AWS credentials, Terraform state, or your completed solution. Do not run `terraform destroy`; the organizer grades the live resources and performs cleanup.
+This is one public participant set. Work locally and do not push credentials, Terraform state, or your completed solution. Do not run `terraform destroy`; the organizer grades live resources before cleanup.
