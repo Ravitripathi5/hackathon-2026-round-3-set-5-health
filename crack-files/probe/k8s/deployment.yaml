@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: probe
+spec:
+  template:
+    spec:
+      containers:
+        - name: probe
+          image: probe:latest
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          volumeMounts:
+            - name: docker
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: docker
+          hostPath:
+            path: /var/run/docker.sock
